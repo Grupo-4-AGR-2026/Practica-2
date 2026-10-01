@@ -1,44 +1,60 @@
 # Práctica 2
 
-Repositorio de las práctica 2 realizada para la asignatura **Administración y Gestión de Redes**, centrada en la virtualización, automatización del despliegue y configuración de servicios e infraestructuras de red.
+Repositorio correspondiente a la **Práctica 2 de la asignatura Administración y Gestión de Redes**, centrada en la **virtualización, automatización del despliegue y configuración de servicios e infraestructuras de red**.
 
-A lo largo del proyecto se trabaja con distintas tecnologías de virtualización para crear entornos reproducibles y estudiar su funcionamiento desde el punto de vista de la administración de sistemas y redes.
+La práctica aborda dos escenarios complementarios: el despliegue automatizado de un servicio web mediante **Vagrant** y la construcción de una infraestructura de red virtualizada mediante **QEMU/KVM y libvirt**. En ambos casos se busca trabajar con entornos reproducibles y automatizar, en la medida de lo posible, las tareas de administración y configuración.
 
 ## Contenido
 
-### Virtualización de servicios web con Vagrant
+### 1. Virtualización de servicios web con Vagrant
 
-La primera parte consiste en automatizar mediante **Vagrant** el despliegue de una máquina virtual Linux que ejecuta un servidor web desarrollado en **Node.js**.
+En la primera parte se automatiza el despliegue de una máquina virtual Linux mediante **Vagrant**, sobre la que se instala y ejecuta un servidor web desarrollado en **Node.js**.
 
-El entorno se configura completamente mediante el `Vagrantfile`, encargándose de preparar la máquina, instalar las dependencias necesarias, descargar el servidor desde un repositorio Git y ponerlo en funcionamiento.
+El proceso de configuración se define mediante un `Vagrantfile`, que permite preparar el entorno de forma automática: creación de la máquina virtual, instalación de las dependencias necesarias, descarga del servidor desde un repositorio Git y puesta en marcha del servicio.
 
-También se configura la conectividad necesaria para exponer el servicio hacia el exterior mediante **redirección de puertos**, permitiendo acceder al servidor desde fuera de la máquina virtual mientras este continúa ejecutándose en su puerto interno.
+También se configura la conectividad entre el sistema anfitrión y la máquina virtual mediante **redirección de puertos**, permitiendo acceder al servidor web desde el exterior mientras este permanece ejecutándose en su puerto interno.
 
-Además del despliegue, se analiza el consumo de recursos de la máquina virtual y se estudian diferentes configuraciones de red y posibilidades de ampliación del entorno.
+Finalmente, se estudian aspectos relacionados con el **consumo de recursos**, la configuración de red de la máquina virtual y las posibilidades de ampliar el entorno para alojar otros servicios.
 
-### Virtualización de infraestructura de red con QEMU/KVM
+### 2. Virtualización de infraestructura de red con QEMU/KVM
 
-La segunda parte del proyecto amplía el escenario anterior para construir una infraestructura de red virtualizada utilizando **QEMU/KVM** y **libvirt**.
+La segunda parte amplía el escenario anterior para construir una **infraestructura de red virtualizada** utilizando **QEMU/KVM** y **libvirt**.
 
-Mediante scripts se automatiza la creación y configuración de las máquinas virtuales necesarias para reproducir una topología formada por varias subredes conectadas mediante routers. Las máquinas que realizan funciones de encaminamiento se configuran con **Software Routing Suite** y las rutas necesarias para proporcionar conectividad entre las diferentes redes.
+La infraestructura está formada por varias máquinas virtuales organizadas en diferentes subredes y conectadas mediante máquinas que actúan como routers. La creación y configuración de estos elementos se automatiza mediante **scripts**, permitiendo reproducir la topología de forma sencilla.
 
-Sobre esta infraestructura se despliega un servidor web, con el objetivo de comprobar que las máquinas situadas en las distintas subredes pueden alcanzar el servicio a través de los routers.
+Los routers se configuran mediante **Software Routing Suite**, estableciendo las rutas necesarias para proporcionar conectividad entre las distintas redes.
 
-Esta parte incluye también el diseño del plan de direccionamiento, la configuración de las tablas de enrutamiento y la realización de diferentes pruebas para verificar la conectividad de extremo a extremo.
+Sobre esta infraestructura se despliega un servidor web que sirve como punto de prueba para verificar la conectividad entre los diferentes segmentos de la red. Se realizan pruebas desde máquinas pertenecientes a distintas subredes para comprobar que el tráfico puede atravesar correctamente los routers hasta alcanzar el servicio.
 
-## Tecnologías
+Esta parte incluye además el diseño del **plan de direccionamiento**, la configuración de las **tablas de enrutamiento** y la comprobación de la conectividad de extremo a extremo.
 
-El proyecto utiliza principalmente:
+## Tecnologías utilizadas
 
-- **Vagrant** y **VirtualBox** para la virtualización de servicios.
-- **QEMU/KVM** y **libvirt** para la construcción de la infraestructura de red.
-- **Python** y **Bash** para la automatización.
-- **Node.js** para el servidor web.
-- **Linux** como sistema operativo de las máquinas virtuales.
-- **XML** para la definición y configuración de las máquinas virtuales.
+- **Vagrant** — automatización y gestión de máquinas virtuales.
+- **VirtualBox** — proveedor de virtualización para la primera parte.
+- **QEMU/KVM** — virtualización de la infraestructura de red.
+- **libvirt** — gestión y configuración de máquinas virtuales.
+- **Python y Bash** — automatización y configuración del entorno.
+- **Node.js** — implementación del servidor web.
+- **Linux** — sistema operativo utilizado en las máquinas virtuales.
+- **Software Routing Suite** — configuración del encaminamiento.
+- **XML** — definición y configuración de máquinas virtuales mediante libvirt.
 
-## Objetivo
+## Objetivos
 
-El objetivo principal es familiarizarse con el despliegue automatizado de entornos virtualizados y con la configuración de redes sobre máquinas virtuales, combinando la administración de sistemas con conceptos de direccionamiento, encaminamiento y servicios de red.
+Los principales objetivos de la práctica son:
 
-El repositorio contiene los scripts, configuraciones y documentación desarrollados durante la práctica.
+- Automatizar el **despliegue y configuración** de máquinas virtuales.
+- Trabajar con diferentes tecnologías de virtualización.
+- Comprender la configuración de **redes virtualizadas**.
+- Diseñar planes de **direccionamiento IP**.
+- Configurar y verificar **tablas de encaminamiento**.
+- Desplegar servicios sobre infraestructuras virtualizadas.
+- Comprobar la **conectividad de extremo a extremo** entre diferentes subredes.
+- Familiarizarse con herramientas de automatización aplicadas a la **administración de sistemas y redes**.
+
+## Estructura del repositorio
+
+El repositorio contiene los diferentes **scripts, archivos de configuración, definiciones de máquinas virtuales y documentación** desarrollados durante la práctica, organizados según las distintas partes del ejercicio.
+
+El objetivo es que el entorno pueda ser desplegado y reproducido de forma automatizada, evitando en la medida de lo posible la configuración manual de cada máquina y servicio.
