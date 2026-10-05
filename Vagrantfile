@@ -88,13 +88,13 @@ Vagrant.configure("2") do |config|
 
     # Descarga (o actualiza) el servidor desde el repositorio Git
     if [ -d "$APP_DIR/.git" ]; then
-      sudo -u vagrant git -C "$APP_DIR" pull
+      sudo -u vagrant -H git -C "$APP_DIR" pull
     else
-      sudo -u vagrant git clone https://github.com/gisai/SSR-master-server.git "$APP_DIR"
+      sudo -u vagrant -H git clone https://github.com/gisai/SSR-master-server.git "$APP_DIR"
     fi
     cd "$APP_DIR"
-    sudo -u vagrant npm install
-    sudo -u vagrant mkdir -p public/logs
+    sudo -u vagrant -H npm install
+    sudo -u vagrant -H mkdir -p public/logs
 
     # Servicio systemd: escucha en el puerto 80 de la VM (redirigido al 3000 del anfitrión).
     # app.js abre además el 3000 internamente, por eso PORT no puede quedarse en 3000.
