@@ -70,8 +70,51 @@ Vagrant.configure("2") do |config|
   # Enable provisioning with a shell script. Additional provisioners such as
   # Ansible, Chef, Docker, Puppet and Salt are also available. Please see the
   # documentation for more information about their specific syntax and use.
-  # config.vm.provision "shell", inline: <<-SHELL
-  #   apt-get update
-  #   apt-get install -y apache2
-  # SHELL
+  config.vm.provision "shell", inline: <<-SHELL
+    set -e
+
+    NODE_VERSION=v16.20.2
+    APP_DIR=/home/vagrant/SSR-master-server
+
+    apt-get update
+    apt-get install -y git curl xz-utils
+
+    # Node.js desde los binarios oficiales (el nodejs de apt en xenial es demasiado antiguo)
+    if ! command -v node >/dev/null || [ "$(node -v)" != "$NODE_VERSION" ]; then
+      curl -fsSL https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-x64.tar.xz \
+        | tar -xJ -C /usr/local --strip-components=1
+    fi
+    npm install -g nodemon
+
+    # Descarga (o actualiza) el servidor desde el repositorio Git
+    if [ -d "$APP_DIR/.git" ]; then
+      sudo -u vagrant git -C "$APP_DIR" pull
+    else
+      sudo -u vagrant git clone https://github.com/gisai/SSR-master-server.git "$APP_DIR"
+    fi
+    cd "$APP_DIR"
+    sudo -u vagrant npm install
+    sudo -u vagrant mkdir -p public/logs
+
+    # Servicio systemd: escucha en el puerto 80 de la VM (redirigido al 3000 del anfitrión).
+    # app.js abre además el 3000 internamente, por eso PORT no puede quedarse en 3000.
+    cat > /etc/systemd/system/ssr-master-server.service <<EOF
+[Unit]
+Description=SSR master server (Data-Logger)
+After=network.target
+
+[Service]
+WorkingDirectory=$APP_DIR
+Environment=PORT=80
+ExecStart=/usr/local/bin/node bin/www
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable ssr-master-server
+    systemctl restart ssr-master-server
+  SHELL
 end
