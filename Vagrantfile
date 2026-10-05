@@ -12,7 +12,7 @@ Vagrant.configure("2") do |config|
 
   # Every Vagrant development environment requires a box. You can search for
   # boxes at https://vagrantcloud.com/search.
-  config.vm.box = "ubuntu/xenial64"
+  config.vm.box = "ubuntu/focal64"
 
   # Disable automatic box update checking. If you disable this, then
   # boxes will only be checked for updates when the user runs
@@ -28,7 +28,7 @@ Vagrant.configure("2") do |config|
   # Create a forwarded port mapping which allows access to a specific port
   # within the machine from a port on the host machine and only allow access
   # via 127.0.0.1 to disable public access
-  config.vm.network "forwarded_port", guest: 80, host: 3000, host_ip: "127.0.0.1"
+  config.vm.network "forwarded_port", guest: 8080, host: 3000, host_ip: "127.0.0.1"
 
   # Create a private network, which allows host-only access to the machine
   # using a specific IP.
@@ -73,17 +73,14 @@ Vagrant.configure("2") do |config|
   config.vm.provision "shell", inline: <<-SHELL
     set -e
 
-    NODE_VERSION=v16.20.2
     APP_DIR=/home/vagrant/SSR-master-server
 
     apt-get update
     apt-get install -y git curl xz-utils
 
-    # Node.js desde los binarios oficiales (el nodejs de apt en xenial es demasiado antiguo)
-    if ! command -v node >/dev/null || [ "$(node -v)" != "$NODE_VERSION" ]; then
-      curl -fsSL https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-x64.tar.xz \
-        | tar -xJ -C /usr/local --strip-components=1
-    fi
+    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+
+    apt-get update
     npm install -g nodemon
 
     # Descarga (o actualiza) el servidor desde el repositorio Git
@@ -105,7 +102,7 @@ After=network.target
 
 [Service]
 WorkingDirectory=$APP_DIR
-Environment=PORT=80
+Environment=PORT=8080
 ExecStart=/usr/local/bin/node bin/www
 Restart=always
 
