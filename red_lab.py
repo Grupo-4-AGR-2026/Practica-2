@@ -1,582 +1,281 @@
 #!/usr/bin/env python3
 """
-red_lab.py - Crea y configura la topología de la práctica con qemu-kvm / virsh.
+Crea y arranca las máquinas virtuales de la práctica a partir de una imagen base
+y las conecta según esta topología:
 
     servidor
-       |  10.0.0.0/24
+       |  10.0.0.0/24        (br-srv-r1)
        R1
-       |  10.0.1.0/24
+       |  10.0.1.0/24        (br-r1-r2)
        R2
      /    \\
-10.0.2.0/24  10.0.3.0/24
+10.0.2.0/24  10.0.3.0/24     (br-r2-r3, br-r2-r4)
    R3          R4
   /  \\        /  \\
-RED1  RED2  RED3  RED4
-.1.0  .2.0  .3.0  .4.0  (192.168.X.0/24)
- pc1   pc2   pc3   pc4
+RED1  RED2  RED3  RED4       (br-red1 ... br-red4)
+ pc1   pc2   pc3   pc4       192.168.1.0/24 ... 192.168.4.0/24
 
-Cada segmento es una red aislada de libvirt (un bridge en el host, sin IP),
-que hace de "switch". Cada RED va en su propio switch, así que queda
-separada como si fuese su propia VLAN.
+El router siempre tiene la 1ª IP de cada red (.1).
 
-Regla de direccionamiento: el router siempre tiene la 1ª IP de la red (.1).
-En los enlaces entre routers, el de arriba tiene la .1 y el de abajo la .2.
-
-Lo que hace:
-  1. Crea las redes en libvirt (persistentes, con autostart).
-  2. Genera para cada VM, en config_vms/<vm>/:
-       - etc/network/interfaces        (IPs, gateway y rutas estáticas)
-       - etc/systemd/network/*.link    (fija los nombres eth0, eth1... por MAC)
-       - etc/sysctl.d/99-router.conf   (ip_forward=1, solo en routers)
-       - etc/hostname y etc/hosts      (puedes hacer "ping r3" por nombre)
-       - consola serie activada        (para usar "virsh console <vm>")
-       - <vm>.xml                      (definición de la VM para virsh)
-  3. Para cada VM:
-       - crea su disco como overlay qcow2 de una imagen base
-       - busca la partición raíz de la imagen base y mete dentro la
-         configuración del paso 2 (guestfish copy-in)
-       - virsh define <vm>.xml
-       - virsh start <vm>
-
-Requisitos en el host:
-  sudo apt install qemu-kvm libvirt-daemon-system libvirt-clients qemu-utils libguestfs-tools
-
-  La imagen base debe ser un Debian (o similar) ya instalado con ifupdown,
-  que ninguna VM esté usando (haz una copia: cp mi-debian.qcow2 base.qcow2).
-  Las VMs se crean como overlays, así que NO modifiques la base después.
+Para cada máquina:
+  1. Crea el disco /var/lib/libvirt/images/agr-<nombre>.qcow2 con qemu-img,
+     usando agr-vm-base.qcow2 como imagen padre (backing file).
+  2. Genera su XML: plantilla-<nombre>.xml (una interfaz por cada red).
+  3. La define y la arranca con virsh.
+  4. Genera configurar-<nombre>.sh con su configuración de red, para
+     pegarlo dentro de la VM (virsh console <nombre>).
 
 Uso:
-  sudo python3 red_lab.py --base /var/lib/libvirt/images/base.qcow2 --dry-run
-  sudo python3 red_lab.py --base /var/lib/libvirt/images/base.qcow2
-  sudo python3 red_lab.py --borrar          # elimina VMs, discos y redes del lab
+    sudo python3 red_lab.py              # crea todas las máquinas
+    sudo python3 red_lab.py r1 pc1       # crea solo esas
 """
 
-import argparse
 import ipaddress
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
-from pathlib import Path
+
+DIR_IMAGENES = "/var/lib/libvirt/images"
+IMAGEN_BASE = os.path.join(DIR_IMAGENES, "agr-vm-base.qcow2")
+
+# Las interfaces se colocan en las ranuras PCI 3, 4, 5... de la VM, así que
+# dentro de Debian se llaman ens3, ens4, ens5... (compruébalo con "ip a").
+PRIMERA_RANURA = 3
+PREFIJO_IFACE = "ens"
 
 # ---------------------------------------------------------------------------
-# TOPOLOGÍA  (modifica aquí nombres de VMs o redes si lo necesitas)
+# TOPOLOGÍA
 # ---------------------------------------------------------------------------
 
-SEGMENTOS = {
-    # nombre       red
-    "srv-r1": "10.0.0.0/24",     # servidor <-> R1
-    "r1-r2":  "10.0.1.0/24",     # R1 <-> R2
-    "r2-r3":  "10.0.2.0/24",     # R2 <-> R3
-    "r2-r4":  "10.0.3.0/24",     # R2 <-> R4
-    "red1":   "192.168.1.0/24",
-    "red2":   "192.168.2.0/24",
-    "red3":   "192.168.3.0/24",
-    "red4":   "192.168.4.0/24",
+# nombre del bridge en el host -> red
+REDES = {
+    "br-srv-r1": "10.0.0.0/24",
+    "br-r1-r2":  "10.0.1.0/24",
+    "br-r2-r3":  "10.0.2.0/24",
+    "br-r2-r4":  "10.0.3.0/24",
+    "br-red1":   "192.168.1.0/24",
+    "br-red2":   "192.168.2.0/24",
+    "br-red3":   "192.168.3.0/24",
+    "br-red4":   "192.168.4.0/24",
 }
 
 
-def ip(segmento, n):
-    """Devuelve la IP número n del segmento (n=1 -> primera IP)."""
-    return str(ipaddress.ip_network(SEGMENTOS[segmento])[n])
+def ip(bridge, n):
+    """IP número n de la red (n=1 -> primera IP)."""
+    return str(ipaddress.ip_network(REDES[bridge])[n])
 
 
-def red(segmento):
-    return SEGMENTOS[segmento]
-
-
-# Las claves son los nombres de las VMs en virsh.
-# ifaces: lista de (segmento, nº de host). El orden marca eth0, eth1, ...
-# rutas:  lista de (destino, via)
+# ifaces: lista de (bridge, nº de host). La 1ª es ens3, la 2ª ens4...
+# rutas:  lista de (red destino, via)
 MAQUINAS = {
-    "servidor": {
-        "router": False,
-        "ifaces": [("srv-r1", 2)],
-        "gateway": ip("srv-r1", 1),
-        "rutas": [],
-    },
-    "r1": {
-        "router": True,
-        "ifaces": [("srv-r1", 1), ("r1-r2", 1)],
-        "gateway": None,
-        "rutas": [
-            (red("r2-r3"), ip("r1-r2", 2)),
-            (red("r2-r4"), ip("r1-r2", 2)),
-            (red("red1"), ip("r1-r2", 2)),
-            (red("red2"), ip("r1-r2", 2)),
-            (red("red3"), ip("r1-r2", 2)),
-            (red("red4"), ip("r1-r2", 2)),
-        ],
-    },
-    "r2": {
-        "router": True,
-        "ifaces": [("r1-r2", 2), ("r2-r3", 1), ("r2-r4", 1)],
-        "gateway": ip("r1-r2", 1),
-        "rutas": [
-            (red("red1"), ip("r2-r3", 2)),
-            (red("red2"), ip("r2-r3", 2)),
-            (red("red3"), ip("r2-r4", 2)),
-            (red("red4"), ip("r2-r4", 2)),
-        ],
-    },
-    "r3": {
-        "router": True,
-        "ifaces": [("r2-r3", 2), ("red1", 1), ("red2", 1)],
-        "gateway": ip("r2-r3", 1),
-        "rutas": [],
-    },
-    "r4": {
-        "router": True,
-        "ifaces": [("r2-r4", 2), ("red3", 1), ("red4", 1)],
-        "gateway": ip("r2-r4", 1),
-        "rutas": [],
-    },
-    # Un equipo de prueba en cada red.
-    "pc1": {"router": False, "ifaces": [("red1", 10)], "gateway": ip("red1", 1), "rutas": []},
-    "pc2": {"router": False, "ifaces": [("red2", 10)], "gateway": ip("red2", 1), "rutas": []},
-    "pc3": {"router": False, "ifaces": [("red3", 10)], "gateway": ip("red3", 1), "rutas": []},
-    "pc4": {"router": False, "ifaces": [("red4", 10)], "gateway": ip("red4", 1), "rutas": []},
+    "servidor": {"router": False, "ifaces": [("br-srv-r1", 2)],
+                 "gateway": ip("br-srv-r1", 1), "rutas": []},
+    "r1": {"router": True, "ifaces": [("br-srv-r1", 1), ("br-r1-r2", 1)],
+           "gateway": None,
+           "rutas": [(REDES[b], ip("br-r1-r2", 2)) for b in
+                     ("br-r2-r3", "br-r2-r4", "br-red1", "br-red2", "br-red3", "br-red4")]},
+    "r2": {"router": True, "ifaces": [("br-r1-r2", 2), ("br-r2-r3", 1), ("br-r2-r4", 1)],
+           "gateway": ip("br-r1-r2", 1),
+           "rutas": [(REDES["br-red1"], ip("br-r2-r3", 2)),
+                     (REDES["br-red2"], ip("br-r2-r3", 2)),
+                     (REDES["br-red3"], ip("br-r2-r4", 2)),
+                     (REDES["br-red4"], ip("br-r2-r4", 2))]},
+    "r3": {"router": True, "ifaces": [("br-r2-r3", 2), ("br-red1", 1), ("br-red2", 1)],
+           "gateway": ip("br-r2-r3", 1), "rutas": []},
+    "r4": {"router": True, "ifaces": [("br-r2-r4", 2), ("br-red3", 1), ("br-red4", 1)],
+           "gateway": ip("br-r2-r4", 1), "rutas": []},
+    "pc1": {"router": False, "ifaces": [("br-red1", 10)], "gateway": ip("br-red1", 1), "rutas": []},
+    "pc2": {"router": False, "ifaces": [("br-red2", 10)], "gateway": ip("br-red2", 1), "rutas": []},
+    "pc3": {"router": False, "ifaces": [("br-red3", 10)], "gateway": ip("br-red3", 1), "rutas": []},
+    "pc4": {"router": False, "ifaces": [("br-red4", 10)], "gateway": ip("br-red4", 1), "rutas": []},
 }
 
-PREFIJO_RED = "lab-"    # nombre de la red en libvirt: lab-red1, lab-r1-r2...
-PREFIJO_BR = "br-"      # nombre del bridge en el host: br-red1, br-r1-r2...
-PREFIJO_DISCO = "lab-"  # nombre del disco: lab-r1.qcow2...
+PLANTILLA_XML = """<domain type="kvm">
+  <name>{nombre}</name>
+  <memory>1048576</memory>
+  <currentMemory>1048576</currentMemory>
+  <vcpu>2</vcpu>
+  <os>
+    <type arch="x86_64">hvm</type>
+    <boot dev="hd"/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <pae/>
+  </features>
+  <clock offset="utc"/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>restart</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2"/>
+      <source file="{disco}"/>
+      <target dev="vda" bus="virtio"/>
+    </disk>
+{interfaces}    <serial type="pty">
+      <target port="0"/>
+    </serial>
+    <console type="pty">
+      <target type="serial" port="0"/>
+    </console>
+    <input type="mouse" bus="ps2"/>
+    <graphics type="vnc" port="-1" autoport="yes"/>
+  </devices>
+</domain>
+"""
+
+PLANTILLA_INTERFAZ = """    <interface type="bridge">
+      <mac address="{mac}"/>
+      <source bridge="{bridge}"/>
+      <model type="virtio"/>
+      <address type="pci" domain="0x0000" bus="0x00" slot="{ranura:#04x}" function="0x0"/>
+    </interface>
+"""
+
 
 # ---------------------------------------------------------------------------
 # UTILIDADES
 # ---------------------------------------------------------------------------
 
-ARGS = None
+def ejecutar(cmd, ignorar_error=False):
+    """Ejecuta un comando y muestra su salida."""
+    print("$ " + " ".join(cmd))
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.stdout.strip():
+        print(res.stdout.strip())
+    if res.returncode != 0 and not ignorar_error:
+        print("ERROR: " + res.stderr.strip())
+        sys.exit(1)
+    return res
 
 
-def virsh(*args):
-    return ["virsh", "-c", ARGS.connect, *args]
+def dominio_existe(nombre):
+    res = subprocess.run(["virsh", "dominfo", nombre], capture_output=True, text=True)
+    return res.returncode == 0
 
 
-def ejecutar(cmd, mostrar_error=True):
-    """Ejecuta un comando que cambia algo. Devuelve True si fue bien."""
-    print("  $", " ".join(cmd))
-    if ARGS.dry_run:
-        return True
-    entorno = dict(os.environ)
-    entorno.setdefault("LIBGUESTFS_BACKEND", "direct")
-    r = subprocess.run(cmd, capture_output=True, text=True, env=entorno)
-    if r.returncode != 0 and mostrar_error:
-        print(f"    ERROR: {(r.stderr or r.stdout).strip()}")
-    return r.returncode == 0
-
-
-def consulta(cmd):
-    """Ejecuta un comando de solo lectura (también en dry-run)."""
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
-    except FileNotFoundError:
-        return None
-    return r.stdout if r.returncode == 0 else None
+def bridge_existe(nombre):
+    res = subprocess.run(["ip", "link", "show", nombre], capture_output=True, text=True)
+    return res.returncode == 0
 
 
 def mac_para(n_vm, n_iface):
     return f"52:54:00:aa:{n_vm:02x}:{n_iface:02x}"
 
 
-def estado_vm(nombre):
-    """'running', 'shut off'... o None si la VM no existe."""
-    salida = consulta(virsh("domstate", nombre))
-    return salida.strip() if salida is not None else None
-
-
-def red_existe(nombre):
-    return consulta(virsh("net-info", nombre)) is not None
-
-
-def ruta_disco(vm):
-    return Path(ARGS.dir_discos) / f"{PREFIJO_DISCO}{vm}.qcow2"
-
-
-def escribir_temporal(texto, sufijo):
-    with tempfile.NamedTemporaryFile("w", suffix=sufijo, delete=False) as f:
-        f.write(texto)
-        return f.name
-
-
 # ---------------------------------------------------------------------------
-# 1. REDES EN LIBVIRT
+# PASOS
 # ---------------------------------------------------------------------------
 
-def crear_redes():
-    print("\n== 1. Creando redes (switches) en libvirt ==")
-    for seg in SEGMENTOS:
-        nombre = PREFIJO_RED + seg
-        bridge = (PREFIJO_BR + seg)[:15]   # límite de Linux: 15 caracteres
-        if red_existe(nombre):
-            print(f"  [ok] {nombre} ya existe")
-            ejecutar(virsh("net-start", nombre), mostrar_error=False)  # por si estaba parada
-            continue
-        xml = (
-            "<network>\n"
-            f"  <name>{nombre}</name>\n"
-            f"  <bridge name='{bridge}' stp='off' delay='0'/>\n"
-            "</network>\n"
-        )
-        ejecutar(virsh("net-define", escribir_temporal(xml, ".xml")))
-        ejecutar(virsh("net-start", nombre))
-        ejecutar(virsh("net-autostart", nombre))
+def crear_bridges():
+    """Un bridge (switch) en el host por cada red, sin IP."""
+    print("\n=== Bridges en el host ===")
+    for bridge in REDES:
+        if bridge_existe(bridge):
+            print(f"{bridge} ya existe")
+        else:
+            ejecutar(["ip", "link", "add", "name", bridge, "type", "bridge"])
+        ejecutar(["ip", "link", "set", bridge, "up"])
 
 
-# ---------------------------------------------------------------------------
-# 2. FICHEROS DE CONFIGURACIÓN
-# ---------------------------------------------------------------------------
+def eliminar_dominio(nombre):
+    """Si el dominio ya existe, lo apaga y lo borra para recrearlo limpio."""
+    if dominio_existe(nombre):
+        print(f"El dominio {nombre} ya existe, se elimina para recrearlo")
+        ejecutar(["virsh", "destroy", nombre], ignorar_error=True)  # falla si ya está apagado
+        ejecutar(["virsh", "undefine", nombre])
 
-def generar_interfaces(vm, datos):
-    lineas = [
-        f"# /etc/network/interfaces de {vm} - generado por red_lab.py",
-        "",
-        "auto lo",
-        "iface lo inet loopback",
-    ]
-    for n_if, (seg, host) in enumerate(datos["ifaces"]):
-        net = ipaddress.ip_network(SEGMENTOS[seg])
-        nombre = f"eth{n_if}"
-        lineas += [
-            "",
-            f"# {seg} ({net})",
-            f"auto {nombre}",
-            f"iface {nombre} inet static",
-            f"    address {net[host]}",
-            f"    netmask {net.netmask}",
-        ]
-        gw = datos["gateway"]
-        if gw and ipaddress.ip_address(gw) in net:
-            lineas.append(f"    gateway {gw}")
+
+def crear_disco(disco):
+    """Crea el disco de la VM tomando la imagen base como padre."""
+    if os.path.exists(disco):
+        os.remove(disco)
+    ejecutar(["qemu-img", "create", "-f", "qcow2",
+              "-b", IMAGEN_BASE, "-F", "qcow2", disco])
+
+
+def crear_xml(n_vm, nombre, disco, fichero_xml):
+    interfaces = ""
+    for n_if, (bridge, _) in enumerate(MAQUINAS[nombre]["ifaces"]):
+        interfaces += PLANTILLA_INTERFAZ.format(
+            mac=mac_para(n_vm, n_if), bridge=bridge, ranura=PRIMERA_RANURA + n_if)
+    with open(fichero_xml, "w") as f:
+        f.write(PLANTILLA_XML.format(nombre=nombre, disco=disco, interfaces=interfaces))
+    print(f"XML generado: {fichero_xml}")
+
+
+def generar_interfaces(nombre):
+    datos = MAQUINAS[nombre]
+    lineas = ["auto lo", "iface lo inet loopback"]
+    for n_if, (bridge, host) in enumerate(datos["ifaces"]):
+        net = ipaddress.ip_network(REDES[bridge])
+        iface = f"{PREFIJO_IFACE}{PRIMERA_RANURA + n_if}"
+        lineas += ["", f"# {bridge} ({net})",
+                   f"auto {iface}",
+                   f"iface {iface} inet static",
+                   f"    address {net[host]}",
+                   f"    netmask {net.netmask}"]
+        if datos["gateway"] and ipaddress.ip_address(datos["gateway"]) in net:
+            lineas.append(f"    gateway {datos['gateway']}")
         for destino, via in datos["rutas"]:
             if ipaddress.ip_address(via) in net:
                 lineas.append(f"    post-up ip route add {destino} via {via}")
     return "\n".join(lineas) + "\n"
 
 
-def generar_hosts(vm):
-    lineas = [
-        "127.0.0.1\tlocalhost",
-        f"127.0.1.1\t{vm}",
-        "",
-        "# Equipos del laboratorio",
-    ]
-    for otra, datos in MAQUINAS.items():
-        seg, host = datos["ifaces"][0]
-        lineas.append(f"{ipaddress.ip_network(SEGMENTOS[seg])[host]}\t{otra}")
-    lineas += [
-        "",
-        "::1\tlocalhost ip6-localhost ip6-loopback",
-        "ff02::1\tip6-allnodes",
-        "ff02::2\tip6-allrouters",
-    ]
-    return "\n".join(lineas) + "\n"
-
-
-def generar_xml_vm(n_vm, vm, datos):
-    interfaces = ""
-    for n_if, (seg, _) in enumerate(datos["ifaces"]):
-        interfaces += (
-            "    <interface type='network'>\n"
-            f"      <mac address='{mac_para(n_vm, n_if)}'/>\n"
-            f"      <source network='{PREFIJO_RED + seg}'/>\n"
-            "      <model type='virtio'/>\n"
-            "    </interface>\n"
-        )
-    firmware = " firmware='efi'" if ARGS.uefi else ""
-    return f"""<domain type='kvm'>
-  <name>{vm}</name>
-  <memory unit='MiB'>{ARGS.ram}</memory>
-  <vcpu>{ARGS.cpus}</vcpu>
-  <os{firmware}>
-    <type arch='x86_64' machine='q35'>hvm</type>
-    <boot dev='hd'/>
-  </os>
-  <features>
-    <acpi/>
-    <apic/>
-  </features>
-  <cpu mode='host-passthrough'/>
-  <on_poweroff>destroy</on_poweroff>
-  <on_reboot>restart</on_reboot>
-  <on_crash>destroy</on_crash>
-  <devices>
-    <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2'/>
-      <source file='{ruta_disco(vm)}'/>
-      <target dev='vda' bus='virtio'/>
-    </disk>
-{interfaces}    <serial type='pty'>
-      <target port='0'/>
-    </serial>
-    <console type='pty'>
-      <target type='serial' port='0'/>
-    </console>
-    <graphics type='vnc' autoport='yes' listen='127.0.0.1'/>
-    <video>
-      <model type='vga'/>
-    </video>
-  </devices>
-</domain>
-"""
-
-
-def generar_ficheros():
-    print(f"\n== 2. Generando ficheros en {ARGS.salida}/ ==")
-    base = Path(ARGS.salida)
-    for n_vm, (vm, datos) in enumerate(MAQUINAS.items(), start=1):
-        dir_vm = base / vm
-        etc = dir_vm / "etc"
-
-        (etc / "network").mkdir(parents=True, exist_ok=True)
-        (etc / "network" / "interfaces").write_text(generar_interfaces(vm, datos))
-
-        (etc / "hostname").write_text(vm + "\n")
-        (etc / "hosts").write_text(generar_hosts(vm))
-
-        (etc / "systemd" / "network").mkdir(parents=True, exist_ok=True)
-        for n_if, _ in enumerate(datos["ifaces"]):
-            (etc / "systemd" / "network" / f"10-eth{n_if}.link").write_text(
-                "[Match]\n"
-                f"MACAddress={mac_para(n_vm, n_if)}\n\n"
-                "[Link]\n"
-                f"Name=eth{n_if}\n"
-            )
-
-        # Activa un login en la consola serie para que funcione "virsh console"
-        wants = etc / "systemd" / "system" / "getty.target.wants"
-        wants.mkdir(parents=True, exist_ok=True)
-        enlace = wants / "serial-getty@ttyS0.service"
-        if not enlace.is_symlink():
-            enlace.symlink_to("/lib/systemd/system/serial-getty@.service")
-
-        if datos["router"]:
-            (etc / "sysctl.d").mkdir(parents=True, exist_ok=True)
-            (etc / "sysctl.d" / "99-router.conf").write_text("net.ipv4.ip_forward=1\n")
-
-        (dir_vm / f"{vm}.xml").write_text(generar_xml_vm(n_vm, vm, datos))
-        print(f"  [ok] {vm}")
-
-
-# ---------------------------------------------------------------------------
-# 3. DISCOS, DEFINICIÓN Y ARRANQUE DE LAS VMs
-# ---------------------------------------------------------------------------
-
-def guestfish(imagen, *args, ro=False, entrada=None):
-    """Lanza guestfish sobre un disco. Devuelve (ok, stdout, stderr)."""
-    cmd = ["guestfish"] + (["--ro"] if ro else []) + ["--format=qcow2", "-a", str(imagen), *args]
-    entorno = dict(os.environ)
-    entorno.setdefault("LIBGUESTFS_BACKEND", "direct")
-    r = subprocess.run(cmd, input=entrada, capture_output=True, text=True, env=entorno)
-    return r.returncode == 0, r.stdout, r.stderr
-
-
-def detectar_raiz(imagen):
-    """
-    Busca en la imagen la partición que contiene /etc (la raíz del sistema),
-    sin depender de la detección automática de SO de libguestfs.
-    """
-    if ARGS.root:
-        print(f"  Partición raíz indicada a mano: {ARGS.root}")
-        return ARGS.root
-    if ARGS.dry_run:
-        return "/dev/sdaX"
-
-    print(f"  Buscando la partición raíz en {imagen} ...")
-    ok, salida, error = guestfish(imagen, "run", ":", "list-filesystems", ro=True)
-    if not ok:
-        print(f"  [!] guestfish no pudo abrir la imagen:\n{error.strip()}")
-        return None
-
-    sistemas = []
-    for linea in salida.splitlines():
-        dev, _, tipo = linea.partition(":")
-        tipo = tipo.strip()
-        if tipo and tipo not in ("swap", "unknown"):
-            sistemas.append(dev.strip())
-    print(f"  Sistemas de ficheros encontrados: {', '.join(sistemas) or 'ninguno'}")
-
-    # Un solo arranque de guestfish que prueba todas las particiones
-    script = "run\n"
-    for dev in sistemas:
-        script += f"-mount-ro {dev} /\necho DEV={dev}\n-is-dir /etc\n-umount-all\n"
-    _, salida, _ = guestfish(imagen, ro=True, entrada=script)
-
-    actual = None
-    for linea in salida.splitlines():
-        if linea.startswith("DEV="):
-            actual = linea[4:]
-        elif linea.strip() == "true" and actual:
-            print(f"  [ok] Partición raíz: {actual}")
-            return actual
-
-    print("  [!] Ninguna partición de la imagen contiene /etc.")
-    print(f"      Revisa la imagen con:  sudo virt-filesystems -a {imagen} --all --long -h")
-    print("      Si sabes cuál es la raíz, pásala con  --root /dev/sdaN")
-    return None
-
-
-def comprobar_requisitos():
-    if ARGS.dry_run:
-        return True
-    ok = True
-    for prog in ("virsh", "qemu-img", "guestfish"):
-        if shutil.which(prog) is None:
-            print(f"  [!] Falta '{prog}'. Instala: sudo apt install libvirt-clients "
-                  "qemu-utils libguestfs-tools")
-            ok = False
-    if not ARGS.base:
-        print("  [!] Indica la imagen base con --base /ruta/imagen.qcow2")
-        ok = False
-    elif not Path(ARGS.base).is_file():
-        print(f"  [!] No existe la imagen base: {ARGS.base}")
-        ok = False
-    return ok
-
-
-def crear_vms():
-    print("\n== 3. Creando y arrancando las VMs ==")
-    if not comprobar_requisitos():
-        print("  No se crean las VMs. Corrige lo anterior y vuelve a ejecutar.")
-        return False
-
-    base = ARGS.base or "/ruta/a/base.qcow2"
-
-    # Todas las VMs son overlays de la misma base: la raíz es la misma en todas
-    raiz = detectar_raiz(base)
-    if raiz is None:
-        print("  No se crean las VMs.")
-        return False
-
-    for vm in MAQUINAS:
-        estado = estado_vm(vm)
-        if estado is not None:
-            print(f"  [ok] {vm} ya existe ({estado}), no la toco")
-            if estado != "running":
-                ejecutar(virsh("start", vm))
-            continue
-
-        disco = ruta_disco(vm)
-        print(f"  -- {vm}")
-
-        # 3a. Disco: overlay sobre la imagen base
-        if disco.exists() and not ARGS.dry_run:
-            print(f"     el disco {disco} ya existe, lo reutilizo")
-        else:
-            if not ejecutar(["qemu-img", "create", "-f", "qcow2",
-                             "-b", str(Path(base).resolve()), "-F", "qcow2", str(disco)]):
-                continue
-
-        # 3b. Meter la configuración dentro del disco (la VM aún no está encendida).
-        #     Se monta la raíz a mano (-m) en vez de usar la detección de SO (-i).
-        if not ejecutar(["guestfish", "--format=qcow2", "-a", str(disco), "-m", raiz,
-                         "copy-in", str(Path(ARGS.salida) / vm / "etc"), "/"]):
-            print(f"     [!] No se pudo copiar la config en {vm}: no la defino ni la arranco.")
-            print("         Corrige el error y vuelve a ejecutar el script.")
-            continue
-
-        # 3c. Definir y arrancar
-        xml = Path(ARGS.salida) / vm / f"{vm}.xml"
-        if ejecutar(virsh("define", str(xml))):
-            ejecutar(virsh("start", vm))
-    return True
-
-
-# ---------------------------------------------------------------------------
-# BORRADO DEL LABORATORIO
-# ---------------------------------------------------------------------------
-
-def borrar_todo():
-    print("Se van a eliminar estas VMs (con sus discos) y redes:")
-    print("  VMs:  ", ", ".join(MAQUINAS))
-    print("  Redes:", ", ".join(PREFIJO_RED + s for s in SEGMENTOS))
-    if not ARGS.dry_run and not ARGS.si:
-        if input("¿Seguro? (s/N) ").strip().lower() != "s":
-            print("Cancelado.")
-            return
-
-    print("\n== Borrando VMs ==")
-    for vm in MAQUINAS:
-        estado = estado_vm(vm)
-        if estado is None and not ARGS.dry_run:
-            print(f"  [-] {vm} no existe")
-        else:
-            if estado == "running" or ARGS.dry_run:
-                ejecutar(virsh("destroy", vm), mostrar_error=False)
-            if not ejecutar(virsh("undefine", vm), mostrar_error=False):
-                ejecutar(virsh("undefine", vm, "--nvram"))
-        disco = ruta_disco(vm)
-        if disco.exists() or ARGS.dry_run:
-            print(f"  $ rm {disco}")
-            if not ARGS.dry_run:
-                disco.unlink()
-
-    print("\n== Borrando redes ==")
-    for seg in SEGMENTOS:
-        nombre = PREFIJO_RED + seg
-        if red_existe(nombre) or ARGS.dry_run:
-            ejecutar(virsh("net-destroy", nombre), mostrar_error=False)
-            ejecutar(virsh("net-undefine", nombre))
-
-
-# ---------------------------------------------------------------------------
-
-def resumen():
-    print("\n== Plan de direccionamiento ==")
-    for vm, datos in MAQUINAS.items():
-        ips = ", ".join(
-            f"eth{i}={ipaddress.ip_network(SEGMENTOS[s])[h]}/{ipaddress.ip_network(SEGMENTOS[s]).prefixlen}"
-            for i, (s, h) in enumerate(datos["ifaces"])
-        )
-        gw = f"  gw {datos['gateway']}" if datos["gateway"] else ""
-        print(f"  {vm:9} {ips}{gw}")
+def crear_script_config(nombre, fichero):
+    """Script para pegar dentro de la VM (como root) que deja su red configurada."""
+    texto = "cat > /etc/network/interfaces <<'EOF'\n"
+    texto += generar_interfaces(nombre)
+    texto += "EOF\n"
+    texto += f"echo {nombre} > /etc/hostname && hostname {nombre}\n"
+    if MAQUINAS[nombre]["router"]:
+        texto += "echo net.ipv4.ip_forward=1 > /etc/sysctl.d/99-router.conf\n"
+        texto += "sysctl -p /etc/sysctl.d/99-router.conf\n"
+    texto += "systemctl restart networking\n"
+    texto += "ip -br a\n"
+    with open(fichero, "w") as f:
+        f.write(texto)
+    print(f"Configuración de red: {fichero}")
 
 
 def main():
-    global ARGS
-    p = argparse.ArgumentParser(description="Crea la red de la práctica con virsh")
-    p.add_argument("--base", help="imagen qcow2 base (Debian instalado con ifupdown)")
-    p.add_argument("--dir-discos", default="/var/lib/libvirt/images",
-                   help="carpeta donde se crean los discos de las VMs")
-    p.add_argument("--ram", type=int, default=512, help="RAM por VM en MiB (512)")
-    p.add_argument("--cpus", type=int, default=1, help="vCPUs por VM (1)")
-    p.add_argument("--root", help="partición raíz de la imagen base (ej. /dev/sda1). "
-                                  "Si no se indica, se busca sola")
-    p.add_argument("--uefi", action="store_true",
-                   help="arrancar con UEFI (si la imagen base se instaló así)")
-    p.add_argument("--salida", default="config_vms", help="carpeta de ficheros generados")
-    p.add_argument("--connect", default="qemu:///system", help="URI de libvirt")
-    p.add_argument("--solo-ficheros", action="store_true",
-                   help="solo generar los ficheros, sin tocar libvirt")
-    p.add_argument("--dry-run", action="store_true", help="solo mostrar los comandos")
-    p.add_argument("--borrar", action="store_true",
-                   help="eliminar las VMs, sus discos y las redes del laboratorio")
-    p.add_argument("--si", action="store_true", help="no pedir confirmación al borrar")
-    ARGS = p.parse_args()
+    if os.geteuid() != 0:
+        sys.exit("Ejecuta el script con sudo")
 
-    if ARGS.dry_run:
-        print("*** MODO SIMULACIÓN: no se ejecuta nada en libvirt ***")
+    if not os.path.exists(IMAGEN_BASE):
+        sys.exit(f"No existe la imagen base {IMAGEN_BASE}")
 
-    if ARGS.borrar:
-        borrar_todo()
-        return 0
+    elegidas = sys.argv[1:] or list(MAQUINAS)
+    for nombre in elegidas:
+        if nombre not in MAQUINAS:
+            sys.exit(f"Máquina desconocida: {nombre}. Opciones: {', '.join(MAQUINAS)}")
 
-    resumen()
-    generar_ficheros()
-    if ARGS.solo_ficheros:
-        return 0
+    crear_bridges()
 
-    crear_redes()
-    if not crear_vms():
-        return 1
+    for n_vm, nombre in enumerate(MAQUINAS, start=1):
+        if nombre not in elegidas:
+            continue
+        disco = os.path.join(DIR_IMAGENES, f"agr-{nombre}.qcow2")
+        fichero_xml = f"plantilla-{nombre}.xml"
 
-    print("\nListo. Comprueba con:")
-    print("  virsh list --all")
-    print("  virsh console pc1        (salir con Ctrl + ])")
-    print("  desde pc1:  ping pc4   ping servidor   traceroute 192.168.4.10")
-    return 0
+        print(f"\n=== Máquina {nombre} ===")
+        eliminar_dominio(nombre)
+        crear_disco(disco)
+        crear_xml(n_vm, nombre, disco, fichero_xml)
+        ejecutar(["virsh", "define", fichero_xml])
+        ejecutar(["virsh", "start", nombre])
+        crear_script_config(nombre, f"configurar-{nombre}.sh")
+
+    print()
+    ejecutar(["virsh", "list", "--all"])
+    print("\nAhora, en cada máquina:")
+    print("  virsh console <nombre>      (salir con Ctrl + ])")
+    print("  entra como root y pega el contenido de configurar-<nombre>.sh")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
