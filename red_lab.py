@@ -33,7 +33,8 @@ Lo que hace:
        - <vm>.xml                      (definición de la VM para virsh)
   3. Para cada VM:
        - crea su disco como overlay qcow2 de una imagen base
-       - mete dentro la configuración del paso 2 (virt-copy-in)
+       - busca la partición raíz de la imagen base y mete dentro la
+         configuración del paso 2 (guestfish copy-in)
        - virsh define <vm>.xml
        - virsh start <vm>
 
@@ -362,11 +363,65 @@ def generar_ficheros():
 # 3. DISCOS, DEFINICIÓN Y ARRANQUE DE LAS VMs
 # ---------------------------------------------------------------------------
 
+def guestfish(imagen, *args, ro=False, entrada=None):
+    """Lanza guestfish sobre un disco. Devuelve (ok, stdout, stderr)."""
+    cmd = ["guestfish"] + (["--ro"] if ro else []) + ["--format=qcow2", "-a", str(imagen), *args]
+    entorno = dict(os.environ)
+    entorno.setdefault("LIBGUESTFS_BACKEND", "direct")
+    r = subprocess.run(cmd, input=entrada, capture_output=True, text=True, env=entorno)
+    return r.returncode == 0, r.stdout, r.stderr
+
+
+def detectar_raiz(imagen):
+    """
+    Busca en la imagen la partición que contiene /etc (la raíz del sistema),
+    sin depender de la detección automática de SO de libguestfs.
+    """
+    if ARGS.root:
+        print(f"  Partición raíz indicada a mano: {ARGS.root}")
+        return ARGS.root
+    if ARGS.dry_run:
+        return "/dev/sdaX"
+
+    print(f"  Buscando la partición raíz en {imagen} ...")
+    ok, salida, error = guestfish(imagen, "run", ":", "list-filesystems", ro=True)
+    if not ok:
+        print(f"  [!] guestfish no pudo abrir la imagen:\n{error.strip()}")
+        return None
+
+    sistemas = []
+    for linea in salida.splitlines():
+        dev, _, tipo = linea.partition(":")
+        tipo = tipo.strip()
+        if tipo and tipo not in ("swap", "unknown"):
+            sistemas.append(dev.strip())
+    print(f"  Sistemas de ficheros encontrados: {', '.join(sistemas) or 'ninguno'}")
+
+    # Un solo arranque de guestfish que prueba todas las particiones
+    script = "run\n"
+    for dev in sistemas:
+        script += f"-mount-ro {dev} /\necho DEV={dev}\n-is-dir /etc\n-umount-all\n"
+    _, salida, _ = guestfish(imagen, ro=True, entrada=script)
+
+    actual = None
+    for linea in salida.splitlines():
+        if linea.startswith("DEV="):
+            actual = linea[4:]
+        elif linea.strip() == "true" and actual:
+            print(f"  [ok] Partición raíz: {actual}")
+            return actual
+
+    print("  [!] Ninguna partición de la imagen contiene /etc.")
+    print(f"      Revisa la imagen con:  sudo virt-filesystems -a {imagen} --all --long -h")
+    print("      Si sabes cuál es la raíz, pásala con  --root /dev/sdaN")
+    return None
+
+
 def comprobar_requisitos():
     if ARGS.dry_run:
         return True
     ok = True
-    for prog in ("virsh", "qemu-img", "virt-copy-in"):
+    for prog in ("virsh", "qemu-img", "guestfish"):
         if shutil.which(prog) is None:
             print(f"  [!] Falta '{prog}'. Instala: sudo apt install libvirt-clients "
                   "qemu-utils libguestfs-tools")
@@ -387,6 +442,13 @@ def crear_vms():
         return False
 
     base = ARGS.base or "/ruta/a/base.qcow2"
+
+    # Todas las VMs son overlays de la misma base: la raíz es la misma en todas
+    raiz = detectar_raiz(base)
+    if raiz is None:
+        print("  No se crean las VMs.")
+        return False
+
     for vm in MAQUINAS:
         estado = estado_vm(vm)
         if estado is not None:
@@ -406,10 +468,13 @@ def crear_vms():
                              "-b", str(Path(base).resolve()), "-F", "qcow2", str(disco)]):
                 continue
 
-        # 3b. Meter la configuración dentro del disco (la VM aún no está encendida)
-        if not ejecutar(["virt-copy-in", "-a", str(disco),
-                         str(Path(ARGS.salida) / vm / "etc"), "/"]):
-            print(f"     [!] No se pudo copiar la config. Hazlo a mano dentro de {vm}.")
+        # 3b. Meter la configuración dentro del disco (la VM aún no está encendida).
+        #     Se monta la raíz a mano (-m) en vez de usar la detección de SO (-i).
+        if not ejecutar(["guestfish", "--format=qcow2", "-a", str(disco), "-m", raiz,
+                         "copy-in", str(Path(ARGS.salida) / vm / "etc"), "/"]):
+            print(f"     [!] No se pudo copiar la config en {vm}: no la defino ni la arranco.")
+            print("         Corrige el error y vuelve a ejecutar el script.")
+            continue
 
         # 3c. Definir y arrancar
         xml = Path(ARGS.salida) / vm / f"{vm}.xml"
@@ -476,6 +541,8 @@ def main():
                    help="carpeta donde se crean los discos de las VMs")
     p.add_argument("--ram", type=int, default=512, help="RAM por VM en MiB (512)")
     p.add_argument("--cpus", type=int, default=1, help="vCPUs por VM (1)")
+    p.add_argument("--root", help="partición raíz de la imagen base (ej. /dev/sda1). "
+                                  "Si no se indica, se busca sola")
     p.add_argument("--uefi", action="store_true",
                    help="arrancar con UEFI (si la imagen base se instaló así)")
     p.add_argument("--salida", default="config_vms", help="carpeta de ficheros generados")
