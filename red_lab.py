@@ -1,97 +1,52 @@
 #!/usr/bin/env python3
 """
-Crea y arranca las máquinas virtuales de la práctica a partir de una imagen base
-y las conecta según esta topología:
+AGR - Virtualización de infraestructura de red con KVM (lab 3103)
 
-    servidor
-       |  10.0.0.0/24        (br-srv-r1)
-       R1
-       |  10.0.1.0/24        (br-r1-r2)
-       R2
-     /    \\
-10.0.2.0/24  10.0.3.0/24     (br-r2-r3, br-r2-r4)
-   R3          R4
-  /  \\        /  \\
-RED1  RED2  RED3  RED4       (br-red1 ... br-red4)
- pc1   pc2   pc3   pc4       192.168.1.0/24 ... 192.168.4.0/24
+Despliega los 4 routers del esquema:
 
-El router siempre tiene la 1ª IP de cada red (.1).
+                 Servidor
+                    |  (br-srv-r1)
+                   R1
+                    |  (br-r1-r2)
+                   R2
+        (br-r2-r3) /   \\ (br-r2-r4)
+                R3     R4
+               /  \\    /  \\
+           RED1 RED2 RED3 RED4      (br-red1 .. br-red4)
 
-Para cada máquina:
-  1. Crea el disco /var/lib/libvirt/images/agr-<nombre>.qcow2 con qemu-img,
-     usando agr-vm-base.qcow2 como imagen padre (backing file).
-  2. Genera su XML: plantilla-<nombre>.xml (una interfaz por cada red).
-  3. La define y la arranca con virsh.
-  4. Genera configurar-<nombre>.sh con su configuración de red, para
-     pegarlo dentro de la VM (virsh console <nombre>).
+- Cada enlace del dibujo es un bridge de Open vSwitch en el anfitrión.
+- Cada router es una copia diferencial (qcow2) de la imagen maestra en
+  /var/lib/libvirt/images; la maestra nunca se modifica.
+- Los XML se generan con lxml a partir de la plantilla de Moodle y se
+  guardan en /etc/libvirt/qemu.
 
-Uso:
-    sudo python3 red_lab.py              # crea todas las máquinas
-    sudo python3 red_lab.py r1 pc1       # crea solo esas
+Uso (como root / con sudo):
+  sudo python3 despliegue.py crear       # bridges + discos + XML + define
+  sudo python3 despliegue.py arrancar    # virsh start
+  sudo python3 despliegue.py consolas    # un xterm con la consola de cada router
+  sudo python3 despliegue.py parar       # virsh shutdown
+  sudo python3 despliegue.py destruir    # destroy + undefine + borra discos, XML y bridges
 """
 
-import ipaddress
+import copy
+import logging
 import os
 import subprocess
 import sys
 
-DIR_IMAGENES = "/var/lib/libvirt/images"
-IMAGEN_BASE = os.path.join(DIR_IMAGENES, "agr-vm-base.qcow2")
+from lxml import etree
 
-# Las interfaces se colocan en las ranuras PCI 3, 4, 5... de la VM, así que
-# dentro de Debian se llaman ens3, ens4, ens5... (compruébalo con "ip a").
-PRIMERA_RANURA = 3
-PREFIJO_IFACE = "ens"
+# ------------------------------ RUTAS ------------------------------
+# Imagen maestra (solo se lee, nunca se modifica)
+IMAGEN_MAESTRA = ("/home/alumno/AGR/Practica-2/mv-xml-configurations/"
+                  "agr-vm-base.qcow2")
+DIR_IMAGENES = "/var/lib/libvirt/images"   # copias de cada router
+DIR_XML = "/etc/libvirt/qemu"              # XML de cada router
+# -------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# TOPOLOGÍA
-# ---------------------------------------------------------------------------
-
-# nombre del bridge en el host -> red
-REDES = {
-    "br-srv-r1": "10.0.0.0/24",
-    "br-r1-r2":  "10.0.1.0/24",
-    "br-r2-r3":  "10.0.2.0/24",
-    "br-r2-r4":  "10.0.3.0/24",
-    "br-red1":   "192.168.1.0/24",
-    "br-red2":   "192.168.2.0/24",
-    "br-red3":   "192.168.3.0/24",
-    "br-red4":   "192.168.4.0/24",
-}
-
-
-def ip(bridge, n):
-    """IP número n de la red (n=1 -> primera IP)."""
-    return str(ipaddress.ip_network(REDES[bridge])[n])
-
-
-# ifaces: lista de (bridge, nº de host). La 1ª es ens3, la 2ª ens4...
-# rutas:  lista de (red destino, via)
-MAQUINAS = {
-    "servidor": {"router": False, "ifaces": [("br-srv-r1", 2)],
-                 "gateway": ip("br-srv-r1", 1), "rutas": []},
-    "r1": {"router": True, "ifaces": [("br-srv-r1", 1), ("br-r1-r2", 1)],
-           "gateway": None,
-           "rutas": [(REDES[b], ip("br-r1-r2", 2)) for b in
-                     ("br-r2-r3", "br-r2-r4", "br-red1", "br-red2", "br-red3", "br-red4")]},
-    "r2": {"router": True, "ifaces": [("br-r1-r2", 2), ("br-r2-r3", 1), ("br-r2-r4", 1)],
-           "gateway": ip("br-r1-r2", 1),
-           "rutas": [(REDES["br-red1"], ip("br-r2-r3", 2)),
-                     (REDES["br-red2"], ip("br-r2-r3", 2)),
-                     (REDES["br-red3"], ip("br-r2-r4", 2)),
-                     (REDES["br-red4"], ip("br-r2-r4", 2))]},
-    "r3": {"router": True, "ifaces": [("br-r2-r3", 2), ("br-red1", 1), ("br-red2", 1)],
-           "gateway": ip("br-r2-r3", 1), "rutas": []},
-    "r4": {"router": True, "ifaces": [("br-r2-r4", 2), ("br-red3", 1), ("br-red4", 1)],
-           "gateway": ip("br-r2-r4", 1), "rutas": []},
-    "pc1": {"router": False, "ifaces": [("br-red1", 10)], "gateway": ip("br-red1", 1), "rutas": []},
-    "pc2": {"router": False, "ifaces": [("br-red2", 10)], "gateway": ip("br-red2", 1), "rutas": []},
-    "pc3": {"router": False, "ifaces": [("br-red3", 10)], "gateway": ip("br-red3", 1), "rutas": []},
-    "pc4": {"router": False, "ifaces": [("br-red4", 10)], "gateway": ip("br-red4", 1), "rutas": []},
-}
-
+# Plantilla XML de Moodle. Los "XXX" se rellenan desde el script con lxml.
 PLANTILLA_XML = """<domain type="kvm">
-  <name>{nombre}</name>
+  <name>XXX</name>
   <memory>1048576</memory>
   <currentMemory>1048576</currentMemory>
   <vcpu>2</vcpu>
@@ -109,13 +64,17 @@ PLANTILLA_XML = """<domain type="kvm">
   <on_reboot>restart</on_reboot>
   <on_crash>restart</on_crash>
   <devices>
-    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <emulator>/usr/bin/kvm</emulator>
     <disk type="file" device="disk">
       <driver name="qemu" type="qcow2"/>
-      <source file="{disco}"/>
+      <source file="/mnt/tmp/XXX/XXX.qcow2"/>
       <target dev="vda" bus="virtio"/>
     </disk>
-{interfaces}    <serial type="pty">
+    <interface type="bridge">
+      <source bridge="XXX"/>
+      <model type="virtio"/>
+    </interface>
+    <serial type="pty">
       <target port="0"/>
     </serial>
     <console type="pty">
@@ -127,155 +86,158 @@ PLANTILLA_XML = """<domain type="kvm">
 </domain>
 """
 
-PLANTILLA_INTERFAZ = """    <interface type="bridge">
-      <mac address="{mac}"/>
-      <source bridge="{bridge}"/>
-      <model type="virtio"/>
-      <address type="pci" domain="0x0000" bus="0x00" slot="{ranura:#04x}" function="0x0"/>
-    </interface>
-"""
+# Topología: cada router y los bridges a los que se conecta, en orden.
+# La 1ª interfaz será eth0 dentro de la VM, la 2ª eth1, etc.
+ROUTERS = {
+    "R1": ["br-srv-r1", "br-r1-r2"],
+    "R2": ["br-r1-r2", "br-r2-r3", "br-r2-r4"],
+    "R3": ["br-r2-r3", "br-red1", "br-red2"],
+    "R4": ["br-r2-r4", "br-red3", "br-red4"],
+}
+
+BRIDGES = sorted({br for brs in ROUTERS.values() for br in brs})
+
+logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] %(message)s")
+log = logging.getLogger("despliegue")
 
 
-# ---------------------------------------------------------------------------
-# UTILIDADES
-# ---------------------------------------------------------------------------
-
-def ejecutar(cmd, ignorar_error=False):
-    """Ejecuta un comando y muestra su salida."""
-    print("$ " + " ".join(cmd))
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.stdout.strip():
-        print(res.stdout.strip())
-    if res.returncode != 0 and not ignorar_error:
-        print("ERROR: " + res.stderr.strip())
-        sys.exit(1)
-    return res
+def run(cmd, check=True):
+    log.debug("$ %s", " ".join(cmd))
+    return subprocess.run(cmd, check=check)
 
 
-def dominio_existe(nombre):
-    res = subprocess.run(["virsh", "dominfo", nombre], capture_output=True, text=True)
-    return res.returncode == 0
+def rutas(vm):
+    return (os.path.join(DIR_IMAGENES, f"{vm}.qcow2"),
+            os.path.join(DIR_XML, f"{vm}.xml"))
 
 
-def bridge_existe(nombre):
-    res = subprocess.run(["ip", "link", "show", nombre], capture_output=True, text=True)
-    return res.returncode == 0
-
-
-def mac_para(n_vm, n_iface):
-    return f"52:54:00:aa:{n_vm:02x}:{n_iface:02x}"
-
-
-# ---------------------------------------------------------------------------
-# PASOS
-# ---------------------------------------------------------------------------
-
+# ----------------------------- RED ---------------------------------
 def crear_bridges():
-    """Un bridge (switch) en el host por cada red, sin IP."""
-    print("\n=== Bridges en el host ===")
-    for bridge in REDES:
-        if bridge_existe(bridge):
-            print(f"{bridge} ya existe")
-        else:
-            ejecutar(["ip", "link", "add", "name", bridge, "type", "bridge"])
-        ejecutar(["ip", "link", "set", bridge, "up"])
+    for br in BRIDGES:
+        run(["ovs-vsctl", "--may-exist", "add-br", br])
+        run(["ip", "link", "set", br, "up"])
+    print(f"Bridges OVS listos: {', '.join(BRIDGES)}")
 
 
-def eliminar_dominio(nombre):
-    """Si el dominio ya existe, lo apaga y lo borra para recrearlo limpio."""
-    if dominio_existe(nombre):
-        print(f"El dominio {nombre} ya existe, se elimina para recrearlo")
-        ejecutar(["virsh", "destroy", nombre], ignorar_error=True)  # falla si ya está apagado
-        ejecutar(["virsh", "undefine", nombre])
+def borrar_bridges():
+    for br in BRIDGES:
+        run(["ovs-vsctl", "--if-exists", "del-br", br], check=False)
 
 
-def crear_disco(disco):
-    """Crea el disco de la VM tomando la imagen base como padre."""
+# ----------------------------- DISCOS ------------------------------
+def crear_disco(vm):
+    disco, _ = rutas(vm)
     if os.path.exists(disco):
-        os.remove(disco)
-    ejecutar(["qemu-img", "create", "-f", "qcow2",
-              "-b", IMAGEN_BASE, "-F", "qcow2", disco])
+        log.info("%s ya existe, no se recrea", disco)
+        return disco
+    # Copia diferencial: los cambios del router van a su qcow2,
+    # la imagen maestra queda intacta (solo se lee).
+    run(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
+         "-b", IMAGEN_MAESTRA, disco])
+    return disco
 
 
-def crear_xml(n_vm, nombre, disco, fichero_xml):
-    interfaces = ""
-    for n_if, (bridge, _) in enumerate(MAQUINAS[nombre]["ifaces"]):
-        interfaces += PLANTILLA_INTERFAZ.format(
-            mac=mac_para(n_vm, n_if), bridge=bridge, ranura=PRIMERA_RANURA + n_if)
-    with open(fichero_xml, "w") as f:
-        f.write(PLANTILLA_XML.format(nombre=nombre, disco=disco, interfaces=interfaces))
-    print(f"XML generado: {fichero_xml}")
+# ----------------------------- XML ---------------------------------
+def generar_xml(vm, disco, bridges):
+    raiz = etree.fromstring(PLANTILLA_XML.encode(),
+                            etree.XMLParser(remove_blank_text=True))
+    arbol = etree.ElementTree(raiz)
+
+    # Nombre de la VM
+    raiz.find("name").text = vm
+
+    # Quitar uuid para que libvirt genere uno nuevo (si no, choca entre VMs)
+    uuid = raiz.find("uuid")
+    if uuid is not None:
+        raiz.remove(uuid)
+
+    devices = raiz.find("devices")
+
+    # Disco -> la copia de este router
+    origen = devices.find("disk[@device='disk']/source")
+    origen.set("file", disco)
+    driver = devices.find("disk[@device='disk']/driver")
+    if driver is not None:
+        driver.set("type", "qcow2")
+
+    # Interfaces: se usa la del XML base como molde (para respetar el
+    # modelo de NIC que espera la imagen) y se borran las originales.
+    originales = devices.findall("interface")
+    molde = originales[0] if originales else None
+    for iface in originales:
+        devices.remove(iface)
+
+    for i, br in enumerate(bridges):
+        if molde is not None:
+            iface = copy.deepcopy(molde)
+            for hijo in list(iface):
+                if hijo.tag != "model":     # solo conservamos el modelo
+                    iface.remove(hijo)
+        else:
+            iface = etree.Element("interface")
+            etree.SubElement(iface, "model", type="virtio")
+
+        iface.set("type", "bridge")
+        iface.insert(0, etree.Element("source", bridge=br))
+        iface.insert(1, etree.Element("virtualport", type="openvswitch"))
+        # Nombre de la tap en el anfitrión, p. ej. r3-e1 (máx. 15 caracteres)
+        iface.insert(2, etree.Element("target", dev=f"{vm.lower()}-e{i}"))
+        devices.append(iface)
+
+    _, ruta_xml = rutas(vm)
+    arbol.write(ruta_xml, pretty_print=True, xml_declaration=False,
+                encoding="utf-8")
+    return ruta_xml
 
 
-def generar_interfaces(nombre):
-    datos = MAQUINAS[nombre]
-    lineas = ["auto lo", "iface lo inet loopback"]
-    for n_if, (bridge, host) in enumerate(datos["ifaces"]):
-        net = ipaddress.ip_network(REDES[bridge])
-        iface = f"{PREFIJO_IFACE}{PRIMERA_RANURA + n_if}"
-        lineas += ["", f"# {bridge} ({net})",
-                   f"auto {iface}",
-                   f"iface {iface} inet static",
-                   f"    address {net[host]}",
-                   f"    netmask {net.netmask}"]
-        if datos["gateway"] and ipaddress.ip_address(datos["gateway"]) in net:
-            lineas.append(f"    gateway {datos['gateway']}")
-        for destino, via in datos["rutas"]:
-            if ipaddress.ip_address(via) in net:
-                lineas.append(f"    post-up ip route add {destino} via {via}")
-    return "\n".join(lineas) + "\n"
-
-
-def crear_script_config(nombre, fichero):
-    """Script para pegar dentro de la VM (como root) que deja su red configurada."""
-    texto = "cat > /etc/network/interfaces <<'EOF'\n"
-    texto += generar_interfaces(nombre)
-    texto += "EOF\n"
-    texto += f"echo {nombre} > /etc/hostname && hostname {nombre}\n"
-    if MAQUINAS[nombre]["router"]:
-        texto += "echo net.ipv4.ip_forward=1 > /etc/sysctl.d/99-router.conf\n"
-        texto += "sysctl -p /etc/sysctl.d/99-router.conf\n"
-    texto += "systemctl restart networking\n"
-    texto += "ip -br a\n"
-    with open(fichero, "w") as f:
-        f.write(texto)
-    print(f"Configuración de red: {fichero}")
-
-
-def main():
+# ----------------------------- ÓRDENES -----------------------------
+def crear():
     if os.geteuid() != 0:
-        sys.exit("Ejecuta el script con sudo")
-
-    if not os.path.exists(IMAGEN_BASE):
-        sys.exit(f"No existe la imagen base {IMAGEN_BASE}")
-
-    elegidas = sys.argv[1:] or list(MAQUINAS)
-    for nombre in elegidas:
-        if nombre not in MAQUINAS:
-            sys.exit(f"Máquina desconocida: {nombre}. Opciones: {', '.join(MAQUINAS)}")
+        sys.exit("Ejecuta con sudo: hay que escribir en /var/lib/libvirt y /etc/libvirt.")
+    if not os.path.isfile(IMAGEN_MAESTRA):
+        sys.exit(f"No encuentro {IMAGEN_MAESTRA}. Revisa la ruta al principio del script.")
+    os.makedirs(DIR_IMAGENES, exist_ok=True)
+    os.makedirs(DIR_XML, exist_ok=True)
 
     crear_bridges()
+    for vm, bridges in ROUTERS.items():
+        disco = crear_disco(vm)
+        xml = generar_xml(vm, disco, bridges)
+        run(["virsh", "define", xml])
+        print(f"{vm} definido: " +
+              ", ".join(f"eth{i}->{br}" for i, br in enumerate(bridges)))
 
-    for n_vm, nombre in enumerate(MAQUINAS, start=1):
-        if nombre not in elegidas:
-            continue
-        disco = os.path.join(DIR_IMAGENES, f"agr-{nombre}.qcow2")
-        fichero_xml = f"plantilla-{nombre}.xml"
 
-        print(f"\n=== Máquina {nombre} ===")
-        eliminar_dominio(nombre)
-        crear_disco(disco)
-        crear_xml(n_vm, nombre, disco, fichero_xml)
-        ejecutar(["virsh", "define", fichero_xml])
-        ejecutar(["virsh", "start", nombre])
-        crear_script_config(nombre, f"configurar-{nombre}.sh")
+def arrancar():
+    for vm in ROUTERS:
+        run(["virsh", "start", vm], check=False)
 
-    print()
-    ejecutar(["virsh", "list", "--all"])
-    print("\nAhora, en cada máquina:")
-    print("  virsh console <nombre>      (salir con Ctrl + ])")
-    print("  entra como root y pega el contenido de configurar-<nombre>.sh")
 
+def consolas():
+    for vm in ROUTERS:
+        # Popen = en segundo plano, el script no se queda bloqueado
+        subprocess.Popen(["xterm", "-T", vm, "-e", f"virsh console {vm}"])
+
+
+def parar():
+    for vm in ROUTERS:
+        run(["virsh", "shutdown", vm], check=False)
+
+
+def destruir():
+    for vm in ROUTERS:
+        run(["virsh", "destroy", vm], check=False)
+        run(["virsh", "undefine", vm], check=False)
+        for f in rutas(vm):
+            if os.path.exists(f):
+                os.remove(f)
+    borrar_bridges()
+
+
+ORDENES = {"crear": crear, "arrancar": arrancar, "consolas": consolas,
+           "parar": parar, "destruir": destruir}
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 2 or sys.argv[1] not in ORDENES:
+        sys.exit(__doc__)
+    ORDENES[sys.argv[1]]()
