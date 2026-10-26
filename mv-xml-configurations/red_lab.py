@@ -228,13 +228,19 @@ def generar_interfaces(nombre):
 
 def crear_script_config(nombre, fichero):
     """Script para pegar dentro de la VM (como root) que deja su red configurada."""
-    texto = "cat > /etc/network/interfaces <<'EOF'\n"
+    # La imagen trae netplan (cloud-init) además de ifupdown: se desactiva netplan
+    # para que no choque con /etc/network/interfaces.
+    texto = "mkdir -p /root/netplan-backup && mv /etc/netplan/*.yaml /root/netplan-backup/ 2>/dev/null\n"
+    texto += "echo 'network: {config: disabled}' > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg\n"
+    texto += "netplan apply 2>/dev/null\n"
+    texto += "cat > /etc/network/interfaces <<'EOF'\n"
     texto += generar_interfaces(nombre)
     texto += "EOF\n"
     texto += f"echo {nombre} > /etc/hostname && hostname {nombre}\n"
     if MAQUINAS[nombre]["router"]:
         texto += "echo net.ipv4.ip_forward=1 > /etc/sysctl.d/99-router.conf\n"
         texto += "sysctl -p /etc/sysctl.d/99-router.conf\n"
+    texto += "systemctl enable networking\n"
     texto += "systemctl restart networking\n"
     texto += "ip -br a\n"
     with open(fichero, "w") as f:
