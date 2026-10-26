@@ -18,24 +18,31 @@ RED1  RED2  RED3  RED4       (br-red1 ... br-red4)
 El router siempre tiene la 1ª IP de cada red (.1).
 
 Para cada máquina:
-  1. Crea el disco /var/lib/libvirt/images/agr-<nombre>.qcow2 con qemu-img,
+  1. Crea el disco DIR_IMAGENES/agr-<nombre>.qcow2 con qemu-img,
      usando agr-vm-base.qcow2 como imagen padre (backing file).
-  2. Genera su XML: plantilla-<nombre>.xml (una interfaz por cada red).
-  3. La define y la arranca con virsh.
-  4. Genera configurar-<nombre>.sh con su configuración de red, para
-     pegarlo dentro de la VM (virsh console <nombre>).
+  2. Genera configurar-<nombre>.sh con su configuración de red.
+  3. Mete ese script dentro del disco (montándolo con qemu-nbd, con la VM
+     todavía apagada) junto con un servicio que lo ejecuta en el primer arranque.
+  4. Genera su XML: plantilla-<nombre>.xml (una interfaz por cada red).
+  5. La define y la arranca con virsh.
+
+Dentro de la VM, el resultado queda en /root/configurar.log
 
 Uso:
     sudo python3 red_lab.py              # crea todas las máquinas
     sudo python3 red_lab.py r1 pc1       # crea solo esas
 """
 
+import glob
 import ipaddress
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 
-DIR_IMAGENES = "/var/lib/libvirt/images"
+DIR_IMAGENES = "/home/alumno/AGR/Practica-2/mv-xml-configurations"
 IMAGEN_BASE = os.path.join(DIR_IMAGENES, "agr-vm-base.qcow2")
 
 # Las interfaces se colocan en las ranuras PCI 3, 4, 5... de la VM, en orden.
@@ -237,6 +244,9 @@ def crear_script_config(nombre, fichero):
     texto += generar_interfaces(nombre)
     texto += "EOF\n"
     texto += f"echo {nombre} > /etc/hostname && hostname {nombre}\n"
+    texto += f"sed -i 's/^127.0.1.1.*/127.0.1.1\\t{nombre}/' /etc/hosts\n"
+    # Que cloud-init no vuelva a poner el hostname de la imagen al reiniciar
+    texto += "echo 'preserve_hostname: true' > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg\n"
     if MAQUINAS[nombre]["router"]:
         texto += "echo net.ipv4.ip_forward=1 > /etc/sysctl.d/99-router.conf\n"
         texto += "sysctl -p /etc/sysctl.d/99-router.conf\n"
@@ -246,6 +256,104 @@ def crear_script_config(nombre, fichero):
     with open(fichero, "w") as f:
         f.write(texto)
     print(f"Configuración de red: {fichero}")
+
+
+# ---------------------------------------------------------------------------
+# METER LA CONFIGURACIÓN EN EL DISCO (con la VM apagada)
+# ---------------------------------------------------------------------------
+
+SERVICIO_PRIMER_ARRANQUE = """[Unit]
+Description=Configuracion de red del laboratorio AGR (solo primer arranque)
+After=local-fs.target network.target cloud-init.service
+ConditionPathExists=!/root/.red-configurada
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '/bin/bash /root/configurar.sh > /root/configurar.log 2>&1; touch /root/.red-configurada'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def nbd_libre():
+    """Devuelve un dispositivo /dev/nbdN que no esté en uso."""
+    for i in range(16):
+        if os.path.exists(f"/sys/block/nbd{i}/pid"):
+            continue  # en uso
+        if os.path.exists(f"/dev/nbd{i}"):
+            return f"/dev/nbd{i}"
+    sys.exit("No hay ningún /dev/nbdN libre")
+
+
+def montar_raiz(dispositivo, punto):
+    """Prueba cada partición del disco y deja montada la que tiene /etc/os-release."""
+    particiones = []
+    for _ in range(20):  # las particiones tardan un momento en aparecer
+        particiones = sorted(glob.glob(dispositivo + "p*"))
+        if particiones:
+            break
+        time.sleep(0.25)
+    for part in particiones:
+        res = subprocess.run(["mount", part, punto], capture_output=True)
+        if res.returncode != 0:
+            continue
+        if os.path.isfile(os.path.join(punto, "etc", "os-release")):
+            print(f"Raíz del sistema: {part}")
+            return True
+        subprocess.run(["umount", punto])
+    return False
+
+
+def meter_configuracion(disco, script):
+    """
+    Conecta el disco como dispositivo de bloques, monta su raíz y copia:
+      /root/configurar.sh
+      /etc/systemd/system/configurar-red.service  (activado)
+    """
+    ejecutar(["modprobe", "nbd", "max_part=16"])
+    dispositivo = nbd_libre()
+    punto = tempfile.mkdtemp(prefix="agr-montaje-")
+    montado = False
+    ejecutar(["qemu-nbd", "--connect", dispositivo, "--format", "qcow2", disco])
+    try:
+        montado = montar_raiz(dispositivo, punto)
+        if not montado:
+            print("ERROR: no encuentro la partición raíz en el disco "
+                  "(¿la imagen base está bien?)")
+            sys.exit(1)
+
+        destino = os.path.join(punto, "root", "configurar.sh")
+        shutil.copy(script, destino)
+        os.chmod(destino, 0o700)
+
+        dir_systemd = os.path.join(punto, "etc", "systemd", "system")
+        with open(os.path.join(dir_systemd, "configurar-red.service"), "w") as f:
+            f.write(SERVICIO_PRIMER_ARRANQUE)
+        wants = os.path.join(dir_systemd, "multi-user.target.wants")
+        os.makedirs(wants, exist_ok=True)
+        enlace = os.path.join(wants, "configurar-red.service")
+        if os.path.lexists(enlace):
+            os.remove(enlace)
+        os.symlink("/etc/systemd/system/configurar-red.service", enlace)
+        print(f"Copiado {script} -> /root/configurar.sh (se ejecuta al arrancar)")
+    finally:
+        if montado:
+            subprocess.run(["umount", punto])
+        subprocess.run(["qemu-nbd", "--disconnect", dispositivo], capture_output=True)
+        os.rmdir(punto)
+
+
+def comprobar_permisos():
+    """libvirt-qemu tiene que poder entrar en las carpetas hasta DIR_IMAGENES."""
+    ruta = os.path.abspath(DIR_IMAGENES)
+    while ruta != "/":
+        if not os.stat(ruta).st_mode & 0o001:
+            print(f"AVISO: {ruta} no tiene permiso de paso para otros usuarios y "
+                  "QEMU no podrá leer los discos. Arréglalo con:")
+            print(f"  sudo chmod o+x {ruta}")
+        ruta = os.path.dirname(ruta)
 
 
 def main():
@@ -260,6 +368,7 @@ def main():
         if nombre not in MAQUINAS:
             sys.exit(f"Máquina desconocida: {nombre}. Opciones: {', '.join(MAQUINAS)}")
 
+    comprobar_permisos()
     crear_bridges()
 
     for n_vm, nombre in enumerate(MAQUINAS, start=1):
@@ -269,18 +378,21 @@ def main():
         fichero_xml = f"plantilla-{nombre}.xml"
 
         print(f"\n=== Máquina {nombre} ===")
+        script = f"configurar-{nombre}.sh"
         eliminar_dominio(nombre)
         crear_disco(disco)
+        crear_script_config(nombre, script)
+        meter_configuracion(disco, script)
         crear_xml(n_vm, nombre, disco, fichero_xml)
         ejecutar(["virsh", "define", fichero_xml])
         ejecutar(["virsh", "start", nombre])
-        crear_script_config(nombre, f"configurar-{nombre}.sh")
 
     print()
     ejecutar(["virsh", "list", "--all"])
-    print("\nAhora, en cada máquina:")
-    print("  virsh console <nombre>      (salir con Ctrl + ])")
-    print("  entra como root y pega el contenido de configurar-<nombre>.sh")
+    print("\nCada máquina se configura sola en su primer arranque (tarda unos segundos).")
+    print("Para comprobarlo:  sudo virt-viewer <nombre>   (root / agr)")
+    print("  ip -br a                  -> IPs")
+    print("  cat /root/configurar.log  -> qué hizo el script")
 
 
 if __name__ == "__main__":
