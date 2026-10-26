@@ -38,10 +38,10 @@ import sys
 DIR_IMAGENES = "/var/lib/libvirt/images"
 IMAGEN_BASE = os.path.join(DIR_IMAGENES, "agr-vm-base.qcow2")
 
-# Las interfaces se colocan en las ranuras PCI 3, 4, 5... de la VM, así que
-# dentro de Debian se llaman ens3, ens4, ens5... (compruébalo con "ip a").
+# Las interfaces se colocan en las ranuras PCI 3, 4, 5... de la VM, en orden.
+# La imagen de Moodle las llama eth0, eth1, eth2... (compruébalo con "ip a").
 PRIMERA_RANURA = 3
-PREFIJO_IFACE = "ens"
+PREFIJO_IFACE = "eth"
 
 # ---------------------------------------------------------------------------
 # TOPOLOGÍA
@@ -65,7 +65,7 @@ def ip(bridge, n):
     return str(ipaddress.ip_network(REDES[bridge])[n])
 
 
-# ifaces: lista de (bridge, nº de host). La 1ª es ens3, la 2ª ens4...
+# ifaces: lista de (bridge, nº de host). La 1ª es eth0, la 2ª eth1...
 # rutas:  lista de (red destino, via)
 MAQUINAS = {
     "servidor": {"router": False, "ifaces": [("br-srv-r1", 2)],
@@ -212,7 +212,7 @@ def generar_interfaces(nombre):
     lineas = ["auto lo", "iface lo inet loopback"]
     for n_if, (bridge, host) in enumerate(datos["ifaces"]):
         net = ipaddress.ip_network(REDES[bridge])
-        iface = f"{PREFIJO_IFACE}{PRIMERA_RANURA + n_if}"
+        iface = f"{PREFIJO_IFACE}{n_if}"
         lineas += ["", f"# {bridge} ({net})",
                    f"auto {iface}",
                    f"iface {iface} inet static",
