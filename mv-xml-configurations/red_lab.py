@@ -3,6 +3,8 @@
 Crea y arranca las máquinas virtuales de la práctica a partir de una imagen base
 y las conecta según esta topología:
 
+    Internet (red NAT "default" de libvirt)
+       |
     servidor
        |  10.0.0.0/24        (br-srv-r1)
        R1
@@ -16,6 +18,12 @@ RED1  RED2  RED3  RED4       (br-red1 ... br-red4)
  pc1   pc2   pc3   pc4       192.168.1.0/24 ... 192.168.4.0/24
 
 El router siempre tiene la 1ª IP de cada red (.1).
+
+El servidor tiene una 2ª interfaz en la red NAT "default" de libvirt para salir a
+Internet: su ruta por defecto va por ahí y al resto del laboratorio llega por R1.
+En su primer arranque clona https://github.com/gisai/SSR-master-server.git
+(Data-Logger, Node.js) en /opt/SSR-master-server y lo deja funcionando como
+servicio systemd (data-logger.service) en el puerto 3000.
 
 Para cada máquina:
   1. Crea el disco DIR_IMAGENES/agr-<nombre>.qcow2 con qemu-img,
@@ -41,6 +49,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 
 DIR_IMAGENES = "/home/alumno/AGR/Practica-2/mv-xml-configurations"
 IMAGEN_BASE = os.path.join(DIR_IMAGENES, "agr-vm-base.qcow2")
@@ -49,6 +58,15 @@ IMAGEN_BASE = os.path.join(DIR_IMAGENES, "agr-vm-base.qcow2")
 # La imagen de Moodle las llama eth0, eth1, eth2... (compruébalo con "ip a").
 PRIMERA_RANURA = 3
 PREFIJO_IFACE = "eth"
+
+# Red NAT de libvirt que da salida a Internet a las máquinas con "internet"
+RED_NAT = "default"
+
+# Aplicación que se instala en las máquinas con "app"
+# (el puerto lo fija app.js; aquí solo se usa para comprobar que responde)
+REPO_APP = "https://github.com/gisai/SSR-master-server.git"
+DIR_APP = "/opt/SSR-master-server"
+PUERTO_APP = 3000
 
 # ---------------------------------------------------------------------------
 # TOPOLOGÍA
@@ -72,11 +90,15 @@ def ip(bridge, n):
     return str(ipaddress.ip_network(REDES[bridge])[n])
 
 
-# ifaces: lista de (bridge, nº de host). La 1ª es eth0, la 2ª eth1...
-# rutas:  lista de (red destino, via)
+# ifaces:   lista de (bridge, nº de host). La 1ª es eth0, la 2ª eth1...
+# rutas:    lista de (red destino, via)
+# internet: nº de host en la red NAT de libvirt; añade una interfaz más (la última)
+#           con la ruta por defecto hacia Internet
+# app:      instala el Data-Logger (necesita "internet")
 MAQUINAS = {
     "servidor": {"router": False, "ifaces": [("br-srv-r1", 2)],
-                 "gateway": ip("br-srv-r1", 1), "rutas": []},
+                 "gateway": None, "internet": 10, "app": True,
+                 "rutas": [(REDES[b], ip("br-srv-r1", 1)) for b in REDES if b != "br-srv-r1"]},
     "r1": {"router": True, "ifaces": [("br-srv-r1", 1), ("br-r1-r2", 1)],
            "gateway": None,
            "rutas": [(REDES[b], ip("br-r1-r2", 2)) for b in
@@ -142,6 +164,14 @@ PLANTILLA_INTERFAZ = """    <interface type="bridge">
     </interface>
 """
 
+PLANTILLA_INTERFAZ_NAT = """    <interface type="network">
+      <mac address="{mac}"/>
+      <source network="{red}"/>
+      <model type="virtio"/>
+      <address type="pci" domain="0x0000" bus="0x00" slot="{ranura:#04x}" function="0x0"/>
+    </interface>
+"""
+
 
 # ---------------------------------------------------------------------------
 # UTILIDADES
@@ -173,6 +203,11 @@ def mac_para(n_vm, n_iface):
     return f"52:54:00:aa:{n_vm:02x}:{n_iface:02x}"
 
 
+def ip_nat(nombre, nat):
+    """IP de la máquina en la red NAT de libvirt."""
+    return str(nat["red"][MAQUINAS[nombre]["internet"]])
+
+
 # ---------------------------------------------------------------------------
 # PASOS
 # ---------------------------------------------------------------------------
@@ -186,6 +221,39 @@ def crear_bridges():
         else:
             ejecutar(["ip", "link", "add", "name", bridge, "type", "bridge"])
         ejecutar(["ip", "link", "set", bridge, "up"])
+
+
+def preparar_red_nat():
+    """Deja activa la red NAT de libvirt y devuelve su red y su gateway."""
+    print(f"\n=== Red NAT '{RED_NAT}' de libvirt (salida a Internet) ===")
+    def redes(*opciones):
+        res = subprocess.run(["virsh", "net-list", "--name", *opciones],
+                             capture_output=True, text=True)
+        return res.stdout.split()
+    if RED_NAT not in redes("--all"):
+        sys.exit(f"No existe la red '{RED_NAT}' de libvirt. Créala con:\n"
+                 f"  sudo virsh net-define /usr/share/libvirt/networks/default.xml")
+    if RED_NAT not in redes():
+        ejecutar(["virsh", "net-start", RED_NAT])
+    ejecutar(["virsh", "net-autostart", RED_NAT])
+
+    xml = subprocess.run(["virsh", "net-dumpxml", RED_NAT],
+                         capture_output=True, text=True).stdout
+    for nodo in ET.fromstring(xml).findall("ip"):
+        if nodo.get("family", "ipv4") == "ipv4":
+            gateway = nodo.get("address")
+            mascara = nodo.get("netmask") or nodo.get("prefix")
+            red = ipaddress.ip_network(f"{gateway}/{mascara}", strict=False)
+            print(f"Red {red}, gateway y DNS {gateway}")
+            return {"red": red, "gateway": gateway}
+    sys.exit(f"La red '{RED_NAT}' no tiene dirección IPv4")
+
+
+def reservar_ip_nat(mac, direccion):
+    """Reserva la IP en el DHCP de la red NAT para que libvirt no se la dé a otra VM."""
+    ejecutar(["virsh", "net-update", RED_NAT, "add", "ip-dhcp-host",
+              f"<host mac='{mac}' ip='{direccion}'/>", "--live", "--config"],
+             ignorar_error=True)  # falla si ya estaba reservada de otra vez
 
 
 def eliminar_dominio(nombre):
@@ -205,16 +273,21 @@ def crear_disco(disco):
 
 
 def crear_xml(n_vm, nombre, disco, fichero_xml):
+    datos = MAQUINAS[nombre]
     interfaces = ""
-    for n_if, (bridge, _) in enumerate(MAQUINAS[nombre]["ifaces"]):
+    for n_if, (bridge, _) in enumerate(datos["ifaces"]):
         interfaces += PLANTILLA_INTERFAZ.format(
             mac=mac_para(n_vm, n_if), bridge=bridge, ranura=PRIMERA_RANURA + n_if)
+    if datos.get("internet"):
+        n_if = len(datos["ifaces"])
+        interfaces += PLANTILLA_INTERFAZ_NAT.format(
+            mac=mac_para(n_vm, n_if), red=RED_NAT, ranura=PRIMERA_RANURA + n_if)
     with open(fichero_xml, "w") as f:
         f.write(PLANTILLA_XML.format(nombre=nombre, disco=disco, interfaces=interfaces))
     print(f"XML generado: {fichero_xml}")
 
 
-def generar_interfaces(nombre):
+def generar_interfaces(nombre, nat):
     datos = MAQUINAS[nombre]
     lineas = ["auto lo", "iface lo inet loopback"]
     for n_if, (bridge, host) in enumerate(datos["ifaces"]):
@@ -230,29 +303,145 @@ def generar_interfaces(nombre):
         for destino, via in datos["rutas"]:
             if ipaddress.ip_address(via) in net:
                 lineas.append(f"    post-up ip route add {destino} via {via}")
+    if datos.get("internet"):
+        iface = f"{PREFIJO_IFACE}{len(datos['ifaces'])}"
+        lineas += ["", f"# red NAT '{RED_NAT}' de libvirt ({nat['red']}): salida a Internet",
+                   f"auto {iface}",
+                   f"iface {iface} inet static",
+                   f"    address {ip_nat(nombre, nat)}",
+                   f"    netmask {nat['red'].netmask}",
+                   f"    gateway {nat['gateway']}"]
     return "\n".join(lineas) + "\n"
 
 
-def crear_script_config(nombre, fichero):
+def script_dns(servidor_dns):
+    """Sin netplan nadie le da servidores DNS a la VM: se usa el dnsmasq de libvirt."""
+    return f"""
+if systemctl is-active --quiet systemd-resolved; then
+    mkdir -p /etc/systemd/resolved.conf.d
+    printf '[Resolve]\\nDNS={servidor_dns}\\nFallbackDNS=8.8.8.8 1.1.1.1\\n' > /etc/systemd/resolved.conf.d/99-agr.conf
+    systemctl restart systemd-resolved
+else
+    rm -f /etc/resolv.conf
+    printf 'nameserver {servidor_dns}\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf
+fi
+"""
+
+
+# Se instala con apt (nodejs, npm, git), se clona en DIR_APP y queda como servicio.
+# Se arranca con "node app.js" y no con "npm start" (README): bin/www vuelve a abrir
+# el puerto 3000 que ya abre app.js y el proceso muere con EADDRINUSE.
+SCRIPT_APP = r"""
+# ---------------------------------------------------------------------------
+# Data-Logger (SSR-master-server)
+# ---------------------------------------------------------------------------
+echo
+echo "=== Instalando Data-Logger ==="
+export HOME=/root DEBIAN_FRONTEND=noninteractive
+
+echo "Esperando a tener Internet..."
+for i in $(seq 1 60); do
+    getent hosts github.com >/dev/null && break
+    sleep 2
+done
+if ! getent hosts github.com >/dev/null; then
+    echo "ERROR: no se resuelve github.com (¿está activa la red NAT en el host?)"
+    exit 1
+fi
+
+# apt puede estar ocupado justo después del arranque (cloud-init, apt-daily...)
+for i in 1 2 3 4 5; do
+    apt-get -o DPkg::Lock::Timeout=300 update && break
+    sleep 15
+done
+if ! apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends \
+        git ca-certificates curl nodejs npm; then
+    echo "ERROR: no se pudieron instalar git, nodejs y npm"
+    exit 1
+fi
+
+if [ -d @DIR@/.git ]; then
+    git -C @DIR@ pull --ff-only
+elif ! git clone @REPO@ @DIR@; then
+    echo "ERROR: no se pudo clonar @REPO@"
+    exit 1
+fi
+cd @DIR@
+if ! npm install --no-audit --no-fund; then
+    echo "ERROR: falló npm install"
+    exit 1
+fi
+
+# El servicio corre con un usuario sin privilegios que solo puede escribir en los logs
+id datalogger >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin datalogger
+mkdir -p public/logs
+chown -R datalogger: public/logs
+
+NODE=$(command -v node || command -v nodejs)
+cat > /etc/systemd/system/data-logger.service <<EOF_UNIT
+[Unit]
+Description=Data-Logger (SSR-master-server)
+After=network.target
+
+[Service]
+User=datalogger
+WorkingDirectory=@DIR@
+ExecStart=$NODE app.js
+Environment=NODE_ENV=production
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+systemctl daemon-reload
+systemctl enable data-logger
+systemctl restart --no-block data-logger
+
+for i in $(seq 1 30); do
+    curl -fs -o /dev/null http://localhost:@PUERTO@/ && break
+    sleep 1
+done
+if curl -fs -o /dev/null http://localhost:@PUERTO@/; then
+    echo "Data-Logger OK en el puerto @PUERTO@"
+else
+    echo "ERROR: Data-Logger no responde en el puerto @PUERTO@"
+    systemctl --no-pager status data-logger
+fi
+"""
+
+
+def script_app():
+    return (SCRIPT_APP.replace("@REPO@", REPO_APP)
+                      .replace("@DIR@", DIR_APP)
+                      .replace("@PUERTO@", str(PUERTO_APP)))
+
+
+def crear_script_config(nombre, fichero, nat):
     """Script para pegar dentro de la VM (como root) que deja su red configurada."""
+    datos = MAQUINAS[nombre]
     # La imagen trae netplan (cloud-init) además de ifupdown: se desactiva netplan
     # para que no choque con /etc/network/interfaces.
     texto = "mkdir -p /root/netplan-backup && mv /etc/netplan/*.yaml /root/netplan-backup/ 2>/dev/null\n"
     texto += "echo 'network: {config: disabled}' > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg\n"
     texto += "netplan apply 2>/dev/null\n"
     texto += "cat > /etc/network/interfaces <<'EOF'\n"
-    texto += generar_interfaces(nombre)
+    texto += generar_interfaces(nombre, nat)
     texto += "EOF\n"
     texto += f"echo {nombre} > /etc/hostname && hostname {nombre}\n"
     texto += f"sed -i 's/^127.0.1.1.*/127.0.1.1\\t{nombre}/' /etc/hosts\n"
     # Que cloud-init no vuelva a poner el hostname de la imagen al reiniciar
     texto += "echo 'preserve_hostname: true' > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg\n"
-    if MAQUINAS[nombre]["router"]:
+    if datos["router"]:
         texto += "echo net.ipv4.ip_forward=1 > /etc/sysctl.d/99-router.conf\n"
         texto += "sysctl -p /etc/sysctl.d/99-router.conf\n"
     texto += "systemctl enable networking\n"
     texto += "systemctl restart networking\n"
+    if datos.get("internet"):
+        texto += script_dns(nat["gateway"])
     texto += "ip -br a\n"
+    if datos.get("app"):
+        texto += script_app()
     with open(fichero, "w") as f:
         f.write(texto)
     print(f"Configuración de red: {fichero}")
@@ -370,6 +559,9 @@ def main():
 
     comprobar_permisos()
     crear_bridges()
+    nat = None
+    if any(MAQUINAS[n].get("internet") for n in elegidas):
+        nat = preparar_red_nat()
 
     for n_vm, nombre in enumerate(MAQUINAS, start=1):
         if nombre not in elegidas:
@@ -381,9 +573,12 @@ def main():
         script = f"configurar-{nombre}.sh"
         eliminar_dominio(nombre)
         crear_disco(disco)
-        crear_script_config(nombre, script)
+        crear_script_config(nombre, script, nat)
         meter_configuracion(disco, script)
         crear_xml(n_vm, nombre, disco, fichero_xml)
+        if MAQUINAS[nombre].get("internet"):
+            reservar_ip_nat(mac_para(n_vm, len(MAQUINAS[nombre]["ifaces"])),
+                            ip_nat(nombre, nat))
         ejecutar(["virsh", "define", fichero_xml])
         ejecutar(["virsh", "start", nombre])
 
@@ -393,6 +588,13 @@ def main():
     print("Para comprobarlo:  sudo virt-viewer <nombre>   (root / agr)")
     print("  ip -br a                  -> IPs")
     print("  cat /root/configurar.log  -> qué hizo el script")
+    for nombre in elegidas:
+        if MAQUINAS[nombre].get("app"):
+            bridge, host = MAQUINAS[nombre]["ifaces"][0]
+            print(f"\nData-Logger en {nombre} (se instala en el primer arranque, unos minutos):")
+            print(f"  desde el host:         http://{ip_nat(nombre, nat)}:{PUERTO_APP}/")
+            print(f"  desde el laboratorio:  http://{ip(bridge, host)}:{PUERTO_APP}/")
+            print(f"  progreso (en {nombre}): tail -f /root/configurar.log")
 
 
 if __name__ == "__main__":
